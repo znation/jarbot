@@ -81,7 +81,10 @@ class Bot:
         self.client = login(settings, reuse_saved=not dry_run, save=not dry_run)
         self._last_login = time.monotonic()
         self.me = self.client.me
-        self._mention_rx = re.compile(r"@" + re.escape(self.me.handle) + r"\b", re.IGNORECASE)
+        mention = r"@" + re.escape(self.me.handle) + r"\b"
+        self._leading_mention = re.compile(r"^(?:\s*" + mention + r"[\s,:]*)+", re.IGNORECASE)
+        self._trailing_mention = re.compile(r"(?:\s*" + mention + r")+[\s.!?]*$", re.IGNORECASE)
+        self._mention_rx = re.compile(mention, re.IGNORECASE)
         log.info("logged in as %s (%s)%s", self.me.handle, self.me.did, " [dry run]" if dry_run else "")
 
     def run_forever(self) -> None:
@@ -192,4 +195,11 @@ class Bot:
         return Context(text=text, author=f"@{notif.author.handle}", thread=thread), my_replies
 
     def _clean(self, text: str) -> str:
-        return self._mention_rx.sub("", text or "").strip()
+        """Drop Jar!'s handle where it just summons the bot; mid-sentence, it becomes the name.
+
+        "@jar what's up" -> "what's up", and "So, I made a thing. @jar, how are
+        you?" -> "So, I made a thing. Jar, how are you?" (not "thing. , how").
+        """
+        text = self._leading_mention.sub("", text or "")
+        text = self._trailing_mention.sub("", text)
+        return self._mention_rx.sub("Jar", text).strip()

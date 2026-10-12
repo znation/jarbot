@@ -242,3 +242,16 @@ def test_auth_error_while_replying_retries_the_post(make_bot):
 def test_dry_run_leaves_saved_session_alone(make_bot):
     bot, _, _ = make_bot([], dry_run=True)
     assert bot.logins[0] == {"reuse_saved": False, "save": False}
+
+
+@pytest.mark.parametrize("text, cleaned", [
+    ("@jarjarbot.bsky.social what's nine plus ten?", "what's nine plus ten?"),
+    ("@jarjarbot.bsky.social, @JarJarBot.bsky.social: hi", "hi"),
+    ("So, I made a thing. @jarjarbot.bsky.social, how are you today?", "So, I made a thing. Jar, how are you today?"),
+    ("what do you think? @jarjarbot.bsky.social", "what do you think?"),
+    ("great post @jarjarbot.bsky.social!", "great post"),
+    ("ask @bob.test about it", "ask @bob.test about it"),
+])
+def test_mention_cleanup(make_bot, text, cleaned):
+    bot, _, _ = make_bot([])
+    assert bot._clean(text) == cleaned
