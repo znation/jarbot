@@ -3,6 +3,8 @@ name = "jarbot"
 version = "0.1.0"
 description = "Jar! - a Bluesky bot from da swamp, using a small local model"
 requires-python = ">=3.11"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 dependencies = [
     "atproto>=0.0.72",
     "huggingface_hub>=0.30",
@@ -16,7 +18,7 @@ test = ["pytest"]
 jarbot = "jarbot.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

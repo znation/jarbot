@@ -82,3 +82,7 @@ To keep it running while you're logged out, run `loginctl enable-linger $USER`.
 - To try a different model, set `JAR_MODEL_REPO` and `JAR_MODEL_FILE` to any chat GGUF on
   Hugging Face, or `JAR_MODEL_PATH` to a local file.
 - Tests: `.venv/bin/pytest`. They use a fake Bluesky client and a fake model.
+
+## License
+
+BSD 3-Clause. See [LICENSE](LICENSE).
