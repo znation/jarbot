@@ -1,0 +1,15 @@
+[Unit]
+Description=Jar! Bluesky bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/jarbot
+ExecStart=%h/jarbot/.venv/bin/jarbot run
+Restart=on-failure
+RestartSec=30
+# Low CPU priority: the iMac throttles under sustained all-core load.
+Nice=10
+
+[Install]
+WantedBy=default.target
