@@ -5,6 +5,9 @@ from types import SimpleNamespace as NS
 
 import pytest
 from atproto import models
+from atproto_client.exceptions import BadRequestError, UnauthorizedError
+from atproto_client.models.common import XrpcError
+from atproto_client.request import Response
 
 from jarbot import bot as botmod
 from jarbot.brain import Context
@@ -70,16 +73,25 @@ class FakeBrain:
 
 @pytest.fixture
 def make_bot(tmp_path, monkeypatch):
-    def make(notifications, threads=None, dry_run=False, **overrides):
+    def make(notifications, threads=None, dry_run=False, clients=None, **overrides):
         client = FakeClient(notifications, threads)
-        monkeypatch.setattr(botmod, "login", lambda settings: client)
+        queue = list(clients or [])  # clients handed out by later logins
+        logins = []
+
+        def fake_login(settings, **kw):
+            logins.append(kw)
+            return client if len(logins) == 1 else queue.pop(0)
+
+        monkeypatch.setattr(botmod, "login", fake_login)
         settings = Settings(handle="jarjarbot.bsky.social", app_password="x", state_dir=tmp_path,
                             poll_seconds=0, max_age_hours=6, max_per_author_per_hour=10, max_per_hour=60,
                             max_replies_per_thread=10, reply_to_bots=False)
         for k, v in overrides.items():
             setattr(settings, k, v)
         brain = FakeBrain()
-        return botmod.Bot(settings, brain, dry_run=dry_run), client, brain
+        bot = botmod.Bot(settings, brain, dry_run=dry_run)
+        bot.logins = logins
+        return bot, client, brain
 
     return make
 
@@ -163,3 +175,70 @@ def test_dry_run_posts_and_records_nothing(make_bot):
     assert client.sent == [] and client.seen_updates == 0
     assert len(brain.contexts) == 1
     assert not bot.store.seen(n.uri)
+
+
+def expired_token():
+    return BadRequestError(Response(success=False, status_code=400, headers={},
+                                    content=XrpcError(error="ExpiredToken", message="Token has expired")))
+
+
+class DeadSessionClient(FakeClient):
+    """A client whose session was invalidated, e.g. by another process refreshing it."""
+
+    def __init__(self, error):
+        super().__init__([])
+
+        class Notification:
+            def list_notifications(self, params):
+                raise error
+
+        self.app = NS(bsky=NS(notification=Notification()))
+
+
+def test_logs_in_again_when_session_dies(make_bot):
+    n = notif("at://x/1", "hello")
+    fresh = FakeClient([n])
+    bot, _, _ = make_bot([], clients=[fresh])
+    bot.client = DeadSessionClient(expired_token())
+    bot._last_login -= botmod.RELOGIN_MIN_SECONDS
+    bot.step()
+    assert bot.client is fresh
+    assert bot.logins[-1] == {"reuse_saved": False, "save": True}  # password login, saved for next start
+    bot.step()
+    assert len(fresh.sent) == 1
+
+
+def test_relogin_is_rate_limited(make_bot):
+    bot, _, _ = make_bot([])
+    dead = DeadSessionClient(UnauthorizedError())
+    bot.client = dead
+    bot.step()  # just logged in at startup: don't hammer createSession
+    assert bot.client is dead and len(bot.logins) == 1
+
+
+def test_other_errors_dont_trigger_login(make_bot):
+    bot, _, _ = make_bot([])
+    bot.client = DeadSessionClient(RuntimeError("network hiccup"))
+    bot._last_login -= botmod.RELOGIN_MIN_SECONDS
+    bot.step()
+    assert len(bot.logins) == 1
+
+
+def test_auth_error_while_replying_retries_the_post(make_bot):
+    n = notif("at://x/1", "hello")
+    bot, client, _ = make_bot([n], clients=[FakeClient([n])])
+
+    def dead_send(**kw):
+        raise expired_token()
+
+    client.send_post = dead_send
+    bot._last_login -= botmod.RELOGIN_MIN_SECONDS
+    bot.step()
+    assert not bot.store.seen(n.uri)  # not marked as handled...
+    bot.step()
+    assert len(bot.client.sent) == 1  # ...so the new session answers it
+
+
+def test_dry_run_leaves_saved_session_alone(make_bot):
+    bot, _, _ = make_bot([], dry_run=True)
+    assert bot.logins[0] == {"reuse_saved": False, "save": False}

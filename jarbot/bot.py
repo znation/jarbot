@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from atproto import Client, SessionEvent, models
-from atproto_client.exceptions import BadRequestError
+from atproto_client.exceptions import BadRequestError, LoginRequiredError, UnauthorizedError
 
 from .brain import Brain, Context
 from .config import Settings
@@ -17,22 +17,32 @@ log = logging.getLogger(__name__)
 
 REASONS = ("mention", "reply", "quote")
 THREAD_PARENTS = 6  # how many posts up the thread to show the model
+RELOGIN_MIN_SECONDS = 300  # Bluesky allows 30 logins per 5 minutes, 300 per day
+_AUTH_ERRORS = {"ExpiredToken", "InvalidToken", "AuthenticationRequired", "AuthMissing"}
 
 
-def login(settings: Settings) -> Client:
+def login(settings: Settings, *, reuse_saved: bool = True, save: bool = True) -> Client:
+    """Log in to Bluesky.
+
+    The saved session in state/session.txt belongs to the long-running bot.
+    Refreshing a session rotates its refresh token and invalidates the old one,
+    so one-off commands must not touch it: they pass reuse_saved=False,
+    save=False and get a session of their own.
+    """
     settings.require_login()
     client = Client()
     session_file = settings.state_dir / "session.txt"
     settings.state_dir.mkdir(parents=True, exist_ok=True)
 
-    def save(event: SessionEvent, session) -> None:
-        if event in (SessionEvent.CREATE, SessionEvent.REFRESH):
-            session_file.write_text(client.export_session_string())
-            os.chmod(session_file, 0o600)
+    if save:
+        def save_session(event: SessionEvent, session) -> None:
+            if event in (SessionEvent.CREATE, SessionEvent.REFRESH):
+                session_file.write_text(client.export_session_string())
+                os.chmod(session_file, 0o600)
 
-    client.on_session_change(save)
+        client.on_session_change(save_session)
     # Reuse the saved session: Bluesky rate-limits fresh logins hard.
-    if session_file.exists():
+    if reuse_saved and session_file.exists():
         try:
             client.login(session_string=session_file.read_text())
             if client.me.handle == settings.handle:
@@ -41,6 +51,15 @@ def login(settings: Settings) -> Client:
             log.info("saved session unusable (%s); logging in again", e)
     client.login(settings.handle, settings.app_password)
     return client
+
+
+def is_auth_error(e: Exception) -> bool:
+    """True when the session is dead (expired, revoked, or its refresh token was rotated away)."""
+    if isinstance(e, (UnauthorizedError, LoginRequiredError)):
+        return True
+    if isinstance(e, BadRequestError) and e.response is not None:
+        return getattr(e.response.content, "error", None) in _AUTH_ERRORS
+    return False
 
 
 def _is_bot(author) -> bool:
@@ -58,18 +77,35 @@ class Bot:
         self.dry_run = dry_run
         self.store = Store(settings.state_dir / "jarbot.db")
         self._dry_seen: set[str] = set()  # a dry run records nothing in the store
-        self.client = login(settings)
+        # A dry run often runs alongside the live bot, so it leaves the saved session alone.
+        self.client = login(settings, reuse_saved=not dry_run, save=not dry_run)
+        self._last_login = time.monotonic()
         self.me = self.client.me
         self._mention_rx = re.compile(r"@" + re.escape(self.me.handle) + r"\b", re.IGNORECASE)
         log.info("logged in as %s (%s)%s", self.me.handle, self.me.did, " [dry run]" if dry_run else "")
 
     def run_forever(self) -> None:
         while True:
-            try:
-                self.poll_once()
-            except Exception:
-                log.exception("poll failed; will retry")
+            self.step()
             time.sleep(self.settings.poll_seconds)
+
+    def step(self) -> None:
+        """One poll, surviving errors; logs in again if the session has died."""
+        try:
+            self.poll_once()
+        except Exception as e:
+            if not is_auth_error(e):
+                log.exception("poll failed; will retry")
+                return
+            if time.monotonic() - self._last_login < RELOGIN_MIN_SECONDS:
+                log.warning("session rejected (%s); logged in recently, so waiting before trying again", e)
+                return
+            log.warning("session rejected (%s); logging in again", e)
+            self._last_login = time.monotonic()
+            try:
+                self.client = login(self.settings, reuse_saved=False, save=not self.dry_run)
+            except Exception:
+                log.exception("login failed; will retry")
 
     def poll_once(self) -> None:
         resp = self.client.app.bsky.notification.list_notifications({"limit": 50})
@@ -127,6 +163,8 @@ class Bot:
                 langs=["en"],
             )
         except BadRequestError as e:  # deleted post, blocked, reply-gated thread...
+            if is_auth_error(e):
+                raise  # not this post's fault: log in again and retry it next poll
             log.warning("could not reply to %s: %s", notif.uri, e)
             self.store.record(notif.uri, notif.author.did, notif.reason, f"error:{e}", ctx.text, reply)
             return

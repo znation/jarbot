@@ -63,7 +63,7 @@ def cmd_profile(args) -> None:
     """Set display name and bio, and label the account as a bot (like Jev!)."""
     from .bot import login
 
-    client = login(Settings.from_env())
+    client = login(Settings.from_env(), reuse_saved=False, save=False)
     try:
         current = client.com.atproto.repo.get_record(
             {"repo": client.me.did, "collection": "app.bsky.actor.profile", "rkey": "self"}
@@ -87,7 +87,7 @@ def cmd_profile(args) -> None:
 def cmd_post(args) -> None:
     from .bot import login
 
-    client = login(Settings.from_env())
+    client = login(Settings.from_env(), reuse_saved=False, save=False)
     post = client.send_post(text=args.text, langs=["en"])
     print(post.uri)
 
