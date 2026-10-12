@@ -39,6 +39,7 @@ class FakeClient:
         self.notifications = notifications
         self.threads = threads or {}
         self.sent = []
+        self.liked = []
         self.seen_updates = 0
         outer = self
 
@@ -56,6 +57,9 @@ class FakeClient:
 
     def get_current_time_iso(self):
         return now_iso()
+
+    def like(self, uri, cid):
+        self.liked.append((uri, cid))
 
     def send_post(self, text, reply_to=None, langs=None):
         self.sent.append((text, reply_to))
@@ -107,6 +111,7 @@ def test_replies_to_mention_once(make_bot):
     # a top-level post: it is both root and parent of Jar!'s reply
     assert reply_ref.root.uri == reply_ref.parent.uri == n.uri
     assert client.seen_updates == 1
+    assert client.liked == [(n.uri, n.cid)]
 
 
 def test_reply_keeps_thread_root(make_bot):
@@ -146,7 +151,7 @@ def test_skips(make_bot):
     ]
     bot, client, _ = make_bot(ns)
     bot.poll_once()
-    assert client.sent == []
+    assert client.sent == [] and client.liked == []
     assert not bot.store.seen("at://x/5")  # likes are not even looked at
     assert all(bot.store.seen(f"at://x/{i}") for i in range(1, 5))
 
@@ -172,7 +177,7 @@ def test_dry_run_posts_and_records_nothing(make_bot):
     bot, client, brain = make_bot([n], dry_run=True)
     bot.poll_once()
     bot.poll_once()
-    assert client.sent == [] and client.seen_updates == 0
+    assert client.sent == [] and client.seen_updates == 0 and client.liked == []
     assert len(brain.contexts) == 1
     assert not bot.store.seen(n.uri)
 
@@ -255,3 +260,17 @@ def test_dry_run_leaves_saved_session_alone(make_bot):
 def test_mention_cleanup(make_bot, text, cleaned):
     bot, _, _ = make_bot([])
     assert bot._clean(text) == cleaned
+
+
+def test_failed_like_does_not_cause_a_second_reply(make_bot):
+    n = notif("at://x/1", "hello")
+    bot, client, _ = make_bot([n])
+
+    def broken_like(uri, cid):
+        raise expired_token()
+
+    client.like = broken_like
+    bot.step()
+    bot.step()
+    assert len(client.sent) == 1
+    assert bot.store.seen(n.uri)

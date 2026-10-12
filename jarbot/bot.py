@@ -172,6 +172,12 @@ class Bot:
             self.store.record(notif.uri, notif.author.did, notif.reason, f"error:{e}", ctx.text, reply)
             return
         self.store.record(notif.uri, notif.author.did, notif.reason, "replied", ctx.text, reply, sent.uri)
+        # Like what Jar! answered. Only after the reply is recorded, and never
+        # fatal: a failed like must not get the post answered twice.
+        try:
+            self.client.like(notif.uri, notif.cid)
+        except Exception as e:
+            log.warning("could not like %s: %s", notif.uri, e)
 
     def context(self, notif) -> tuple[Context, int]:
         """The post's text and the thread above it; also how often Jar! already spoke there."""

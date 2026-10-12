@@ -29,8 +29,8 @@ is a clumsy, relentlessly positive amphibian with its own way of talking. Tag it
    spelling back, so *da* becomes *the*, *tink* becomes *think*, and *swimmin'* becomes
    *swimming*.
    It also strips @-mentions, links, hashtags and emoji, and fits the reply in one post.
-5. **Reply.** Jar! posts the reply in the thread and records the post in `state/jarbot.db`, so
-   it never answers the same post twice.
+5. **Reply.** Jar! posts the reply in the thread, likes the post it answered, and records the
+   post in `state/jarbot.db`, so it never answers the same post twice.
 
 Guardrails: Jar! doesn't reply to accounts labelled as bots, which prevents bot-to-bot loops. It
 answers each author at most 10 times an hour and posts at most 60 replies an hour overall. It
