@@ -1,5 +1,6 @@
 """Bookkeeping: which posts Jar! has handled, so it never replies twice."""
 
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -8,6 +9,10 @@ from pathlib import Path
 class Store:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Private from the moment it exists: it holds other people's post text.
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(fd, 0o600)  # an older file may have looser permissions
+        os.close(fd)
         self.db = sqlite3.connect(path)
         self.db.execute(
             """CREATE TABLE IF NOT EXISTS handled (

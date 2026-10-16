@@ -39,7 +39,9 @@ Guardrails: Jar! doesn't reply to accounts labelled as bots, which prevents bot-
 answers each author at most 10 times an hour and posts at most 60 replies an hour overall
 (replies that fail to post count too, since they still cost a turn of the model). It
 stops after 10 replies in one thread, skips threads whose reply settings shut it out, and ignores
-mentions older than 24 hours. All of these can be changed in `.env`.
+mentions older than 24 hours. A post that fails to reply — the model chokes, or Bluesky refuses
+or loses the reply — is recorded and never tried again, so one bad post can't keep burning the
+CPU or hold up the mentions behind it. All of these can be changed in `.env`.
 
 ## Setup
 

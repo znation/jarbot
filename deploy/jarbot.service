@@ -11,5 +11,20 @@ RestartSec=30
 # Low CPU priority: the iMac throttles under sustained all-core load.
 Nice=10
 
+# Hardening: the bot needs the network, its repo, and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/jarbot/state %h/jarbot/models
+PrivateDevices=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
 [Install]
 WantedBy=default.target

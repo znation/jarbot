@@ -1,5 +1,6 @@
 """Bot logic against a fake Bluesky client and a fake model."""
 
+import os
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as NS
 
@@ -386,7 +387,8 @@ def test_one_failing_post_does_not_hold_up_the_next(make_bot):
     client.send_post = send_post
     bot.step()
     assert [ref.parent.uri for _, ref in client.sent] == [second.uri]
-    assert not bot.store.seen(first.uri)  # a passing failure: try it again next poll
+    assert bot.store.seen(first.uri)  # recorded as an error, never tried again
+    assert bot.store.seen(second.uri)
 
 
 def test_replies_that_fail_to_post_count_toward_rate_limits(make_bot):
@@ -408,6 +410,31 @@ def test_skips_threads_with_replies_disabled(make_bot):
     bot.poll_once()
     assert brain.contexts == [] and client.sent == []
     assert bot.store.seen(n.uri)
+
+
+
+def test_thread_load_failure_fails_closed(make_bot):
+    n = notif("at://x/1", "answer me blind")
+    bot, client, brain = make_bot([n])
+
+    def broken_thread(uri, depth=0, parent_height=0):
+        raise RuntimeError("thread API down")
+
+    client.get_post_thread = broken_thread
+    bot.poll_once()
+    assert brain.contexts == [] and client.sent == []
+    assert bot.store.seen(n.uri)  # skipped, not answered without the safety checks
+
+
+def test_store_file_is_private(tmp_path):
+    from jarbot.store import Store
+    old_umask = os.umask(0)
+    try:
+        store = Store(tmp_path / "jarbot.db")
+    finally:
+        os.umask(old_umask)
+    store.record("at://x/1", "did:plc:a", "mention", "replied")
+    assert (tmp_path / "jarbot.db").stat().st_mode & 0o777 == 0o600
 
 
 def test_session_file_is_private(tmp_path, monkeypatch):

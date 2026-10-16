@@ -244,9 +244,12 @@ class Bot:
                 reply_to=models.AppBskyFeedPost.ReplyRef(root=root, parent=parent),
                 langs=["en"],
             )
-        except BadRequestError as e:  # deleted post, blocked, reply-gated thread...
+        except Exception as e:  # deleted post, blocked, reply-gated thread, network...
             if is_auth_error(e):
                 raise  # not this post's fault: log in again and retry it next poll
+            # Recorded and never retried: a retry would run the model again for
+            # the same post, without limit, and none of it counted toward the
+            # rate caps. (A reply that might have gone through is not sent twice.)
             log.warning("could not reply to %s: %s", notif.uri, e)
             self.store.record(notif.uri, notif.author.did, notif.reason, f"error:{e}", ctx.text, reply)
             return
@@ -267,19 +270,22 @@ class Bot:
         replies_disabled = False
         try:
             view = self.client.get_post_thread(notif.uri, depth=0, parent_height=50).thread
-            viewer = getattr(getattr(view, "post", None), "viewer", None)
-            replies_disabled = bool(getattr(viewer, "reply_disabled", False))
-            node = getattr(view, "parent", None)
-            while node is not None and hasattr(node, "post"):
-                author = node.post.author
-                if author.did == self.me.did:
-                    my_replies += 1
-                if len(thread) < THREAD_PARENTS:
-                    name = "Jar! (you)" if author.did == self.me.did else f"@{author.handle}"
-                    thread.append((name, self._clean(node.post.record.text)))
-                node = getattr(node, "parent", None)
         except Exception as e:
+            # Fail closed: without the thread, the reply-gate and per-thread cap
+            # can't be checked, so the post is skipped, not answered blind.
             log.warning("could not load thread for %s: %s", notif.uri, e)
+            return Context(text=text, author=f"@{notif.author.handle}", thread=[]), 0, True
+        viewer = getattr(getattr(view, "post", None), "viewer", None)
+        replies_disabled = bool(getattr(viewer, "reply_disabled", False))
+        node = getattr(view, "parent", None)
+        while node is not None and hasattr(node, "post"):
+            author = node.post.author
+            if author.did == self.me.did:
+                my_replies += 1
+            if len(thread) < THREAD_PARENTS:
+                name = "Jar! (you)" if author.did == self.me.did else f"@{author.handle}"
+                thread.append((name, self._clean(node.post.record.text)))
+            node = getattr(node, "parent", None)
         thread.reverse()
         return Context(text=text, author=f"@{notif.author.handle}", thread=thread), my_replies, replies_disabled
 
