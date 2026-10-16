@@ -40,8 +40,11 @@ def login(settings: Settings, *, reuse_saved: bool = True, save: bool = True) ->
     if save:
         def save_session(event: SessionEvent, session) -> None:
             if event in (SessionEvent.CREATE, SessionEvent.REFRESH):
-                session_file.write_text(client.export_session_string())
-                os.chmod(session_file, 0o600)
+                # Private from the moment it exists, not just after the tokens are in it.
+                fd = os.open(session_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                os.fchmod(fd, 0o600)  # an older file may have looser permissions
+                with os.fdopen(fd, "w") as f:
+                    f.write(client.export_session_string())
 
         client.on_session_change(save_session)
     # Reuse the saved session: Bluesky rate-limits fresh logins hard.
@@ -138,7 +141,14 @@ class Bot:
         for notif in sorted(fresh, key=_when):  # oldest first
             if self.dry_run:
                 self._dry_seen.add(notif.uri)
-            self.handle(notif)
+            try:
+                self.handle(notif)
+            except Exception as e:
+                if is_auth_error(e):
+                    raise
+                # Left unrecorded, so it is tried again next poll; one bad post
+                # must not hold up the ones after it.
+                log.exception("could not handle %s", notif.uri)
         if fresh and not self.dry_run:
             self.client.app.bsky.notification.update_seen({"seen_at": self.client.get_current_time_iso()})
 
@@ -206,14 +216,22 @@ class Bot:
             log.warning("global hourly cap reached; leaving %s for later", notif.uri)
             return  # don't record: try again next poll
 
-        ctx, my_replies = self.context(notif)
+        ctx, my_replies, replies_disabled = self.context(notif)
+        if replies_disabled:
+            return self._skip(notif, "replies disabled")
         if my_replies >= s.max_replies_per_thread:
             return self._skip(notif, "thread reply limit")
         if not ctx.text and not ctx.thread:
             return self._skip(notif, "empty post")
 
         t0 = time.monotonic()
-        reply = self.brain.reply(ctx)
+        try:
+            reply = self.brain.reply(ctx)
+        except Exception as e:  # never retried: the same post would fail the same way
+            log.exception("could not generate a reply to %s", notif.uri)
+            if not self.dry_run:
+                self.store.record(notif.uri, notif.author.did, notif.reason, f"error:generation:{e}", ctx.text)
+            return
         log.info("@%s: %r\n  -> %r (%.1fs)", notif.author.handle, ctx.text, reply, time.monotonic() - t0)
         if self.dry_run:
             return
@@ -240,13 +258,17 @@ class Bot:
         except Exception as e:
             log.warning("could not like %s: %s", notif.uri, e)
 
-    def context(self, notif) -> tuple[Context, int]:
-        """The post's text and the thread above it; also how often Jar! already spoke there."""
+    def context(self, notif) -> tuple[Context, int, bool]:
+        """The post's text and the thread above it; also how often Jar! already
+        spoke there, and whether the thread's reply settings shut Jar! out."""
         text = self._clean(notif.record.text)
         thread: list[tuple[str, str]] = []
         my_replies = 0
+        replies_disabled = False
         try:
             view = self.client.get_post_thread(notif.uri, depth=0, parent_height=50).thread
+            viewer = getattr(getattr(view, "post", None), "viewer", None)
+            replies_disabled = bool(getattr(viewer, "reply_disabled", False))
             node = getattr(view, "parent", None)
             while node is not None and hasattr(node, "post"):
                 author = node.post.author
@@ -259,7 +281,7 @@ class Bot:
         except Exception as e:
             log.warning("could not load thread for %s: %s", notif.uri, e)
         thread.reverse()
-        return Context(text=text, author=f"@{notif.author.handle}", thread=thread), my_replies
+        return Context(text=text, author=f"@{notif.author.handle}", thread=thread), my_replies, replies_disabled
 
     def _clean(self, text: str) -> str:
         """Drop Jar!'s handle where it just summons the bot; mid-sentence, it becomes the name.

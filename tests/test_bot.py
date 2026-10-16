@@ -348,3 +348,92 @@ def test_older_than_a_day_is_skipped(make_bot):
     bot.poll_once()
     assert len(client.sent) == 1
     assert bot.store.seen(old.uri)  # recorded as skipped
+
+
+def bad_request(error="InvalidRequest"):
+    return BadRequestError(Response(success=False, status_code=400, headers={},
+                                    content=XrpcError(error=error, message="nope")))
+
+
+def test_post_the_model_chokes_on_does_not_block_the_rest(make_bot):
+    poison, ok = notif("at://x/1", "poison", hours_ago=1), notif("at://x/2", "hello")
+    bot, client, brain = make_bot([poison, ok])
+    real_reply = brain.reply
+
+    def reply(ctx):
+        if ctx.text == "poison":
+            raise ValueError("Requested tokens (9000) exceed context window of 4096")
+        return real_reply(ctx)
+
+    brain.reply = reply
+    bot.step()
+    bot.step()
+    assert [text for text, _ in client.sent] == ["Meesa reply #1"]
+    assert client.sent[0][1].parent.uri == ok.uri
+    assert bot.store.seen(poison.uri)  # recorded as an error, never tried again
+
+
+def test_one_failing_post_does_not_hold_up_the_next(make_bot):
+    first, second = notif("at://x/1", "one", hours_ago=1), notif("at://x/2", "two")
+    bot, client, _ = make_bot([first, second])
+    real_send = client.send_post
+
+    def send_post(text, reply_to=None, langs=None):
+        if reply_to.parent.uri == first.uri:
+            raise RuntimeError("network hiccup")
+        return real_send(text, reply_to=reply_to, langs=langs)
+
+    client.send_post = send_post
+    bot.step()
+    assert [ref.parent.uri for _, ref in client.sent] == [second.uri]
+    assert not bot.store.seen(first.uri)  # a passing failure: try it again next poll
+
+
+def test_replies_that_fail_to_post_count_toward_rate_limits(make_bot):
+    ns = [notif(f"at://x/{i}", f"hi {i}") for i in range(5)]
+    bot, client, brain = make_bot(ns, max_per_author_per_hour=3)
+
+    def gated(**kw):
+        raise bad_request()
+
+    client.send_post = gated
+    bot.poll_once()
+    assert len(brain.contexts) == 3
+
+
+def test_skips_threads_with_replies_disabled(make_bot):
+    n = notif("at://x/1", "you can't answer this")
+    gated = NS(post=NS(viewer=NS(reply_disabled=True)), parent=None)
+    bot, client, brain = make_bot([n], threads={n.uri: gated})
+    bot.poll_once()
+    assert brain.contexts == [] and client.sent == []
+    assert bot.store.seen(n.uri)
+
+
+def test_session_file_is_private(tmp_path, monkeypatch):
+    from atproto import SessionEvent
+
+    class FakeAtproto:
+        def on_session_change(self, callback):
+            self.callback = callback
+
+        def login(self, handle=None, password=None, session_string=None):
+            self.me = NS(handle=handle, did=ME)
+            self.callback(SessionEvent.CREATE, None)
+
+        def export_session_string(self):
+            return "secret tokens"
+
+    monkeypatch.setattr(botmod, "Client", FakeAtproto)
+    session = tmp_path / "session.txt"
+    session.write_text("old")
+    session.chmod(0o644)
+    old_umask = botmod.os.umask(0)
+    try:
+        botmod.login(Settings(handle="jar.test", app_password="x", state_dir=tmp_path, poll_seconds=0,
+                              max_age_hours=24, sweep_minutes=10, max_per_author_per_hour=10, max_per_hour=60,
+                              max_replies_per_thread=10, reply_to_bots=False), reuse_saved=False)
+    finally:
+        botmod.os.umask(old_umask)
+    assert session.read_text() == "secret tokens"
+    assert session.stat().st_mode & 0o777 == 0o600

@@ -36,9 +36,10 @@ is a clumsy, relentlessly positive amphibian with its own way of talking. Tag it
    post in `state/jarbot.db`, so it never answers the same post twice.
 
 Guardrails: Jar! doesn't reply to accounts labelled as bots, which prevents bot-to-bot loops. It
-answers each author at most 10 times an hour and posts at most 60 replies an hour overall. It
-stops after 10 replies in one thread and ignores mentions older than 24 hours. All of these can be
-changed in `.env`.
+answers each author at most 10 times an hour and posts at most 60 replies an hour overall
+(replies that fail to post count too, since they still cost a turn of the model). It
+stops after 10 replies in one thread, skips threads whose reply settings shut it out, and ignores
+mentions older than 24 hours. All of these can be changed in `.env`.
 
 ## Setup
 
@@ -48,7 +49,9 @@ python3 -m venv .venv
 cp .env.example .env                    # then fill in handle + app password
 ```
 
-The model downloads into `./models` the first time it's used.
+The model downloads into `./models` the first time it's used. It is pinned to a fixed commit of
+the Hugging Face repo (`PINNED_REVISIONS` in [jarbot/brain.py](jarbot/brain.py)), so an upstream
+change never reaches the bot until you update the pin.
 
 Try it locally, no Bluesky needed:
 
@@ -83,7 +86,8 @@ To keep it running while you're logged out, run `loginctl enable-linger $USER`.
   `CMAKE_ARGS="-DGGML_CUDA=on" pip install --force-reinstall --no-cache-dir llama-cpp-python`
   and set `JAR_GPU_LAYERS=99`.
 - To try a different model, set `JAR_MODEL_REPO` and `JAR_MODEL_FILE` to any chat GGUF on
-  Hugging Face, or `JAR_MODEL_PATH` to a local file.
+  Hugging Face, or `JAR_MODEL_PATH` to a local file. `unsloth/gemma-3-4b-it-GGUF` is pinned
+  already; for any other repo, also set `JAR_MODEL_REVISION` to the commit hash to download.
 - Tests: `.venv/bin/pytest`. They use a fake Bluesky client and a fake model.
 
 ## License

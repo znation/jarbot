@@ -5,6 +5,7 @@ import os
 import random
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .speech import jarify
 from .persona import Persona, PersonaPicker, denial, mask_franchise, mentions_franchise, scramble_names
@@ -13,6 +14,16 @@ log = logging.getLogger(__name__)
 
 DEFAULT_REPO = "unsloth/Qwen3-4B-Instruct-2507-GGUF"
 DEFAULT_FILE = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+# Fixed commits of the repos Jar! has been tried with, so a change upstream
+# never reaches the bot unreviewed. Any other repo needs JAR_MODEL_REVISION.
+PINNED_REVISIONS = {
+    DEFAULT_REPO: "a06e946bb6b655725eafa393f4a9745d460374c9",
+    "unsloth/gemma-3-4b-it-GGUF": "5a3566e716d80f709ed7b79817eaf7733d2a1fce",
+}
+_COMMIT = re.compile(r"[0-9a-f]{40}")
+N_CTX = 4096
+MAX_TOKENS = 120
+MESSAGE_OVERHEAD = 10  # tokens the chat template adds around each message, generously
 
 SYSTEM_PROMPT = """\
 You are Jar!, a Bluesky bot. Your full name is {full_name}. You are a {species}: \
@@ -136,7 +147,7 @@ class Brain:
         log.info("loading %s (threads=%d, gpu_layers=%d)", model_path, n_threads, n_gpu_layers)
         self.llm = Llama(
             model_path=model_path,
-            n_ctx=4096,
+            n_ctx=N_CTX,
             n_threads=n_threads,
             n_gpu_layers=n_gpu_layers,
             seed=seed if seed is not None else random.randrange(2**31),
@@ -157,10 +168,33 @@ class Brain:
         msgs.append({"role": "user", "content": _format_user_turn(ctx)})
         return msgs
 
+    def fitted_messages(self, ctx: Context, persona: Persona) -> list[dict]:
+        """messages(), trimmed to fit the context window.
+
+        A post can cost far more tokens than its 300 characters suggest (zalgo
+        text runs to a token per byte or so), and llama.cpp refuses a prompt
+        that doesn't fit. Drop the oldest thread posts first, then cut the post.
+        """
+        budget = N_CTX - MAX_TOKENS
+        text, thread = ctx.text, list(ctx.thread)
+        while True:
+            msgs = self.messages(Context(text, ctx.author, thread), persona)
+            over = sum(self._tokens(m["content"]) + MESSAGE_OVERHEAD for m in msgs) - budget
+            if over <= 0 or not (text or thread):
+                return msgs
+            if thread:
+                thread.pop(0)
+                continue
+            tokens = self.llm.tokenize(text.encode(), add_bos=False)
+            text = self.llm.detokenize(tokens[: max(0, len(tokens) - over)]).decode(errors="ignore")
+
+    def _tokens(self, text: str) -> int:
+        return len(self.llm.tokenize(text.encode(), add_bos=False))
+
     def raw_reply(self, ctx: Context, persona: Persona) -> str:
         out = self.llm.create_chat_completion(
-            messages=self.messages(ctx, persona),
-            max_tokens=120,
+            messages=self.fitted_messages(ctx, persona),
+            max_tokens=MAX_TOKENS,
             temperature=self.temperature,
             top_p=0.95,
             repeat_penalty=1.1,
@@ -185,5 +219,20 @@ def _download_default() -> str:
 
     repo = os.environ.get("JAR_MODEL_REPO", DEFAULT_REPO)
     filename = os.environ.get("JAR_MODEL_FILE", DEFAULT_FILE)
+    revision = os.environ.get("JAR_MODEL_REVISION") or PINNED_REVISIONS.get(repo)
+    if not revision or not _COMMIT.fullmatch(revision):
+        # A branch or tag can be moved to a different file at any time.
+        raise SystemExit(f"Set JAR_MODEL_REVISION to the commit hash of {repo} to download.")
     models_dir = os.environ.get("JAR_MODELS_DIR", "models")
-    return hf_hub_download(repo, filename, local_dir=models_dir)
+    path = hf_hub_download(repo, filename, revision=revision, local_dir=models_dir)
+    # When the Hub can't be reached, hf_hub_download falls back to whatever
+    # file is already on disk, from whatever commit. Its download record says
+    # which commit that was (and is ignored if the file changed since).
+    from huggingface_hub._local_folder import read_download_metadata
+
+    record = read_download_metadata(Path(models_dir), filename)
+    if record is None or record.commit_hash != revision:
+        found = record.commit_hash if record else "an unknown commit"
+        raise SystemExit(f"{path} is from {found}, not the pinned {revision}, and it could not be "
+                         "updated (is Hugging Face reachable?).")
+    return path

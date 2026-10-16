@@ -35,7 +35,14 @@ class Store:
         self.db.commit()
 
     def replies_since(self, seconds: float, author_did: str | None = None) -> int:
-        q = "SELECT COUNT(*) FROM handled WHERE status = 'replied' AND handled_at > ?"
+        """Replies generated recently, posted or not.
+
+        A reply that failed to post still cost a turn of the model, so it
+        counts: otherwise posts Jar! can't answer (in a thread with replies
+        turned off, say) could keep the CPU busy without limit.
+        """
+        q = ("SELECT COUNT(*) FROM handled WHERE (status = 'replied' OR status LIKE 'error:%')"
+             " AND handled_at > ?")
         args: list = [time.time() - seconds]
         if author_did:
             q += " AND author_did = ?"
