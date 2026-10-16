@@ -5,6 +5,7 @@ import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from atproto import Client, SessionEvent, models
 from atproto_client.exceptions import BadRequestError, LoginRequiredError, UnauthorizedError
@@ -17,6 +18,8 @@ log = logging.getLogger(__name__)
 
 REASONS = ("mention", "reply", "quote")
 THREAD_PARENTS = 6  # how many posts up the thread to show the model
+PAGE_SIZE = 50
+MAX_SWEEP_PAGES = 20  # a hard stop, in case a cursor never runs out
 RELOGIN_MIN_SECONDS = 300  # Bluesky allows 30 logins per 5 minutes, 300 per day
 _AUTH_ERRORS = {"ExpiredToken", "InvalidToken", "AuthenticationRequired", "AuthMissing"}
 
@@ -70,6 +73,10 @@ def _did_of(uri: str) -> str:
     return uri.split("/")[2]
 
 
+def _when(item) -> datetime:
+    return datetime.fromisoformat(item.indexed_at.replace("Z", "+00:00"))
+
+
 class Bot:
     def __init__(self, settings: Settings, brain: Brain, dry_run: bool = False):
         self.settings = settings
@@ -80,6 +87,7 @@ class Bot:
         # A dry run often runs alongside the live bot, so it leaves the saved session alone.
         self.client = login(settings, reuse_saved=not dry_run, save=not dry_run)
         self._last_login = time.monotonic()
+        self._last_sweep: float | None = None  # None: sweep on the first poll
         self.me = self.client.me
         mention = r"@" + re.escape(self.me.handle) + r"\b"
         self._leading_mention = re.compile(r"^(?:\s*" + mention + r"[\s,:]*)+", re.IGNORECASE)
@@ -111,15 +119,69 @@ class Bot:
                 log.exception("login failed; will retry")
 
     def poll_once(self) -> None:
-        resp = self.client.app.bsky.notification.list_notifications({"limit": 50})
-        fresh = [n for n in resp.notifications
-                 if n.reason in REASONS and not self.store.seen(n.uri) and n.uri not in self._dry_seen]
-        for notif in reversed(fresh):  # oldest first
+        """Answer new mentions, replies and quotes.
+
+        A normal poll reads one page of notifications. A sweep, on startup and
+        every JAR_SWEEP_MINUTES, also looks back JAR_MAX_AGE_HOURS: it pages
+        through older notifications (to catch up after downtime) and searches
+        for "@handle" in post text (posts that name Jar! without a proper
+        mention link never produce a notification at all).
+        """
+        now = time.monotonic()
+        sweep = self._last_sweep is None or now - self._last_sweep >= self.settings.sweep_minutes * 60
+        items = {n.uri: n for n in self._notifications(deep=sweep)}
+        if sweep:
+            self._last_sweep = now
+            for post in self._text_mentions():
+                items.setdefault(post.uri, post)  # the notification, if any, knows the real reason
+        fresh = [n for n in items.values() if not self.store.seen(n.uri) and n.uri not in self._dry_seen]
+        for notif in sorted(fresh, key=_when):  # oldest first
             if self.dry_run:
                 self._dry_seen.add(notif.uri)
             self.handle(notif)
         if fresh and not self.dry_run:
             self.client.app.bsky.notification.update_seen({"seen_at": self.client.get_current_time_iso()})
+
+    def _cutoff(self) -> datetime:
+        return datetime.now(timezone.utc) - timedelta(hours=self.settings.max_age_hours)
+
+    def _notifications(self, deep: bool) -> list:
+        """Mention/reply/quote notifications: one page, or (deep) back to the age cutoff."""
+        out, cursor = [], None
+        for _ in range(MAX_SWEEP_PAGES if deep else 1):
+            params = {"limit": PAGE_SIZE, "reasons": list(REASONS)}
+            if cursor:
+                params["cursor"] = cursor
+            resp = self.client.app.bsky.notification.list_notifications(params)
+            out += [n for n in resp.notifications if n.reason in REASONS]
+            cursor = resp.cursor
+            if not cursor or not resp.notifications or _when(resp.notifications[-1]) < self._cutoff():
+                break
+        return out
+
+    def _text_mentions(self) -> list:
+        """Posts since the age cutoff whose text says "@handle", shaped like mention notifications."""
+        needle = "@" + self.me.handle.lower()
+        out, cursor = [], None
+        try:
+            for _ in range(MAX_SWEEP_PAGES):
+                params = {"q": self.me.handle, "sort": "latest", "limit": 100,
+                          "since": self._cutoff().isoformat().replace("+00:00", "Z")}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = self.client.app.bsky.feed.search_posts(params)
+                for p in resp.posts:
+                    if p.author.did != self.me.did and needle in (getattr(p.record, "text", "") or "").lower():
+                        out.append(SimpleNamespace(uri=p.uri, cid=p.cid, author=p.author, record=p.record,
+                                                   reason="mention", indexed_at=p.indexed_at))
+                cursor = resp.cursor
+                if not cursor or not resp.posts:
+                    break
+        except Exception as e:
+            if is_auth_error(e):
+                raise
+            log.warning("search for text mentions failed: %s", e)  # notifications still work
+        return out
 
     def _skip(self, notif, why: str) -> None:
         log.info("skip %s from @%s: %s", notif.uri, notif.author.handle, why)
@@ -133,8 +195,7 @@ class Bot:
             return self._skip(notif, "own post")
         if _is_bot(notif.author) and not s.reply_to_bots:
             return self._skip(notif, "author is a bot")
-        indexed = datetime.fromisoformat(notif.indexed_at.replace("Z", "+00:00"))
-        if datetime.now(timezone.utc) - indexed > timedelta(hours=s.max_age_hours):
+        if _when(notif) < self._cutoff():
             return self._skip(notif, "too old")
         if notif.reason == "reply" and record.reply and _did_of(record.reply.parent.uri) != self.me.did:
             # Someone replied to someone else further down a thread Jar! started.

@@ -24,6 +24,7 @@ class Settings:
     state_dir: Path
     poll_seconds: float
     max_age_hours: float
+    sweep_minutes: float
     max_per_author_per_hour: int
     max_per_hour: int
     max_replies_per_thread: int
@@ -42,7 +43,8 @@ class Settings:
             app_password=e("BSKY_APP_PASSWORD", ""),
             state_dir=Path(e("JAR_STATE_DIR", "state")),
             poll_seconds=float(e("JAR_POLL_SECONDS", "20")),
-            max_age_hours=float(e("JAR_MAX_AGE_HOURS", "6")),
+            max_age_hours=float(e("JAR_MAX_AGE_HOURS", "24")),
+            sweep_minutes=float(e("JAR_SWEEP_MINUTES", "10")),
             max_per_author_per_hour=int(e("JAR_MAX_PER_AUTHOR_PER_HOUR", "10")),
             max_per_hour=int(e("JAR_MAX_PER_HOUR", "60")),
             max_replies_per_thread=int(e("JAR_MAX_REPLIES_PER_THREAD", "10")),

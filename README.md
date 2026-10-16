@@ -9,7 +9,10 @@ is a clumsy, relentlessly positive amphibian with its own way of talking. Tag it
 ## How it works
 
 1. **Notifications.** `jarbot run` polls the account's notifications every 20 s for mentions,
-   quotes, and replies to Jar!'s own posts ([jarbot/bot.py](jarbot/bot.py)).
+   quotes, and replies to Jar!'s own posts ([jarbot/bot.py](jarbot/bot.py)). On startup and
+   every 10 minutes it also sweeps back 24 hours, to catch up on anything it missed while it was
+   down. The sweep also searches post text for `@handle`, because a post that names Jar! without
+   a real mention link (for example, a pasted handle) never produces a notification.
 2. **Context.** It loads up to 6 posts above the mention in the thread, so replies follow the
    conversation.
 3. **Generation.** A small open model from Hugging Face writes the reply locally through
@@ -34,7 +37,7 @@ is a clumsy, relentlessly positive amphibian with its own way of talking. Tag it
 
 Guardrails: Jar! doesn't reply to accounts labelled as bots, which prevents bot-to-bot loops. It
 answers each author at most 10 times an hour and posts at most 60 replies an hour overall. It
-stops after 10 replies in one thread and ignores mentions older than 6 hours. All of these can be
+stops after 10 replies in one thread and ignores mentions older than 24 hours. All of these can be
 changed in `.env`.
 
 ## Setup

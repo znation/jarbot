@@ -34,23 +34,37 @@ def ref(uri):
 
 
 class FakeClient:
-    def __init__(self, notifications, threads=None):
+    def __init__(self, notifications, threads=None, search=None, page_size=None):
         self.me = NS(did=ME, handle="jarjarbot.bsky.social")
-        self.notifications = notifications
+        self.notifications = notifications  # oldest first
+        self.search = search or []  # posts the text search finds
         self.threads = threads or {}
         self.sent = []
         self.liked = []
         self.seen_updates = 0
+        self.pages_read = 0
+        self.searches = 0
         outer = self
 
         class Notification:
             def list_notifications(self, params):
-                return NS(notifications=list(reversed(outer.notifications)))  # newest first
+                # newest first, paged, filtered by reason like the real API
+                items = [n for n in reversed(outer.notifications) if n.reason in params.get("reasons", [n.reason])]
+                size = page_size or params["limit"]
+                start = int(params.get("cursor") or 0)
+                outer.pages_read += 1
+                more = start + size < len(items)
+                return NS(notifications=items[start:start + size], cursor=str(start + size) if more else None)
 
             def update_seen(self, params):
                 outer.seen_updates += 1
 
-        self.app = NS(bsky=NS(notification=Notification()))
+        class Feed:
+            def search_posts(self, params):
+                outer.searches += 1
+                return NS(posts=list(outer.search), cursor=None)
+
+        self.app = NS(bsky=NS(notification=Notification(), feed=Feed()))
 
     def get_post_thread(self, uri, depth=0, parent_height=0):
         return NS(thread=self.threads.get(uri, NS(post=None, parent=None)))
@@ -88,7 +102,8 @@ def make_bot(tmp_path, monkeypatch):
 
         monkeypatch.setattr(botmod, "login", fake_login)
         settings = Settings(handle="jarjarbot.bsky.social", app_password="x", state_dir=tmp_path,
-                            poll_seconds=0, max_age_hours=6, max_per_author_per_hour=10, max_per_hour=60,
+                            poll_seconds=0, max_age_hours=24, sweep_minutes=10,
+                            max_per_author_per_hour=10, max_per_hour=60,
                             max_replies_per_thread=10, reply_to_bots=False)
         for k, v in overrides.items():
             setattr(settings, k, v)
@@ -143,7 +158,7 @@ def test_thread_context_oldest_first(make_bot):
 def test_skips(make_bot):
     ns = [
         notif("at://x/1", "from a bot", who=author("did:plc:b", "b.test", bot=True)),
-        notif("at://x/2", "old", hours_ago=10),
+        notif("at://x/2", "old", hours_ago=30),
         notif("at://x/3", "mine", who=author(ME, "jarjarbot.bsky.social")),
         notif("at://x/4", "talking to bob under Jar!'s thread", reason="reply",
               reply=NS(root=ref(f"at://{ME}/app.bsky.feed.post/r"), parent=ref("at://did:plc:bob/app.bsky.feed.post/p"))),
@@ -274,3 +289,62 @@ def test_failed_like_does_not_cause_a_second_reply(make_bot):
     bot.step()
     assert len(client.sent) == 1
     assert bot.store.seen(n.uri)
+
+
+def post(uri, text, who=author("did:plc:carol", "carol.test"), hours_ago=0):
+    """A search result: a post view, which has no notification reason."""
+    return NS(uri=uri, cid="cid-" + uri, author=who, indexed_at=now_iso(hours_ago), record=NS(text=text, reply=None))
+
+
+def test_finds_mentions_that_have_no_notification(make_bot):
+    p = post("at://x/plain", "@jarjarbot.bsky.social what's the correct number here?")
+    bot, client, brain = make_bot([])
+    client.search = [p, post("at://x/about", "jarjarbot.bsky.social is a fun bot")]  # second one isn't addressed to Jar!
+    bot.poll_once()
+    assert [ctx.text for ctx in brain.contexts] == ["what's the correct number here?"]
+    assert client.sent[0][1].parent.uri == p.uri
+    assert bot.store.seen(p.uri) and not bot.store.seen("at://x/about")
+
+
+def test_post_found_twice_is_answered_once(make_bot):
+    n = notif("at://x/1", "@jarjarbot.bsky.social hi")
+    bot, client, _ = make_bot([n])
+    client.search = [post(n.uri, n.record.text, who=n.author)]
+    bot.poll_once()
+    assert len(client.sent) == 1
+
+
+def test_sweeps_only_now_and_then(make_bot):
+    bot, client, _ = make_bot([])
+    bot.poll_once()
+    bot.poll_once()
+    assert client.searches == 1
+    bot._last_sweep -= bot.settings.sweep_minutes * 60
+    bot.poll_once()
+    assert client.searches == 2
+
+
+def test_catches_up_on_older_pages_after_downtime(make_bot, monkeypatch):
+    monkeypatch.setattr(botmod, "PAGE_SIZE", 2)
+    ns = [notif(f"at://x/{i}", f"hi {i}", who=author(f"did:plc:u{i}", f"u{i}.test"), hours_ago=20 - i)
+          for i in range(5)]
+    likes = [notif(f"at://x/like{i}", "", reason="like") for i in range(10)]
+    bot, client, brain = make_bot(ns + likes)
+    bot.poll_once()  # startup sweep: pages back through all of them, likes filtered out
+    assert [c.text for c in brain.contexts] == ["hi 0", "hi 1", "hi 2", "hi 3", "hi 4"]  # oldest first
+
+
+def test_normal_poll_reads_one_page(make_bot, monkeypatch):
+    monkeypatch.setattr(botmod, "PAGE_SIZE", 2)
+    bot, client, _ = make_bot([notif(f"at://x/{i}", "hi") for i in range(5)])
+    bot._last_sweep = botmod.time.monotonic()  # pretend a sweep just ran
+    bot.poll_once()
+    assert client.pages_read == 1
+
+
+def test_older_than_a_day_is_skipped(make_bot):
+    old = notif("at://x/old", "hello?", hours_ago=25)
+    bot, client, _ = make_bot([old, notif("at://x/new", "hi", hours_ago=23)])
+    bot.poll_once()
+    assert len(client.sent) == 1
+    assert bot.store.seen(old.uri)  # recorded as skipped
